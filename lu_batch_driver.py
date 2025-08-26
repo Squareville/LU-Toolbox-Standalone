@@ -1,15 +1,16 @@
 # lu_batch_driver.py
 # Headless LXF/LXFML -> NIF (LEGO Universe)
-# Minimal pipeline with device auto-detect:
-#   --device auto (default): honor saved Blender prefs (CUDA/OPTIX enabled state)
-#   --device cuda/optix/cpu: force backend
-# Keeps: headless UI patches, importer robustness, vertex-color ensure, export scale fix.
+# - Device: --device auto by default (honors saved CUDA/OPTIX prefs)
+# - .lxf import prefers direct importer; unzip to .lxfml only as fallback
+# - Headless-safe: wrap LU Toolbox viewport-dependent methods with a proxy context
+#   so apply_vertex_colors runs with perfect parity (viewport shading calls no-op).
 import sys, os, argparse, zipfile, tempfile, shutil, traceback
 import bpy
 
 def eprint(*a): print(*a, file=sys.stderr)
-print("=== LU DRIVER START (auto-device) ===")
+print("=== LU DRIVER START (headless parity for apply_vertex_colors) ===")
 
+# --------------------- Arg parsing ---------------------
 def split_script_argv():
     argv = sys.argv
     if "--" in argv:
@@ -34,7 +35,6 @@ def _log_devices(cp, prefix="[Device] Found"):
         eprint(f"[Device] Listing devices failed: {ex}")
 
 def set_cycles_device_auto():
-    """Honor existing prefs; enable LU GPU flags based on whether any CUDA/OPTIX device is enabled."""
     try:
         bpy.ops.preferences.addon_enable(module="cycles")
     except Exception:
@@ -111,47 +111,81 @@ def set_lu_gpu_flags(use_gpu: bool):
     except Exception as ex:
         eprint(f"[Props] Could not set LU GPU flags: {ex}")
 
-# --------------------- Headless UI patching ---------------------
-def _headless_patch_method(cls, method_name):
+# --------------------- Headless viewport-safe wrappers ---------------------
+class _ShadingProxy:
+    # Minimal shading proxy; attributes are set as LU reads/writes them
+    def __init__(self):
+        # Prepopulate common properties LU might touch
+        self.color_type = getattr(self, "color_type", "MATERIAL")
+        self.use_scene_lights = getattr(self, "use_scene_lights", False)
+        self.use_scene_world = getattr(self, "use_scene_world", False)
+
+class _SpaceProxy:
+    def __init__(self):
+        self.shading = _ShadingProxy()
+
+class _AreaProxy:
+    def __init__(self):
+        self.spaces = [_SpaceProxy()]
+
+class _CtxProxy:
+    """Wraps Blender's Context but supplies a fake .area with .spaces[0].shading.
+    All other attributes delegate to the real context.
+    """
+    def __init__(self, base_ctx):
+        self._base_ctx = base_ctx
+        self.area = _AreaProxy()
+    def __getattr__(self, name):
+        return getattr(self._base_ctx, name)
+
+def _wrap_ctx_method(cls, method_name):
+    """Wrap cls.method_name so it receives a context with a viewport shading proxy."""
     if not hasattr(cls, method_name):
         return False
-    def _stub(self, context, *args, **kwargs):
-        print(f"[HeadlessPatch] {cls.__name__}.{method_name}() skipped (background mode).")
-        return None
-    try:
-        setattr(cls, method_name, _stub)
-        return True
-    except Exception:
+    orig = getattr(cls, method_name)
+    if not callable(orig):
         return False
+    def _wrapped(self, context, *a, **kw):
+        try:
+            ctx = _CtxProxy(context) if getattr(context, "area", None) is None else context
+            return orig(self, ctx, *a, **kw)
+        except Exception as ex:
+            # If anything fails due to headless viewport, log and continue
+            eprint(f"[HeadlessWrap] {cls.__name__}.{method_name}() warning: {ex}")
+            return orig(self, context, *a, **kw)
+    setattr(cls, method_name, _wrapped)
+    print(f"[HeadlessWrap] Wrapped {cls.__name__}.{method_name}")
+    return True
 
 def _apply_headless_patches():
-    if not bpy.app.background:
-        return False
+    """Patch LU Toolbox methods that use viewport shading so they work headless."""
     patched = False
-    pm = None; bl = None
     try:
         pm = __import__("lu_toolbox.process_model", fromlist=['*'])
     except Exception as ex:
-        eprint(f"[HeadlessPatch] Could not import lu_toolbox.process_model: {ex}")
-    try:
-        bl = __import__("lu_toolbox.bake_lighting", fromlist=['*'])
-    except Exception as ex:
-        eprint(f"[HeadlessPatch] Could not import lu_toolbox.bake_lighting: {ex}")
-    target_methods = ("apply_vertex_colors", "set_viewport_to_vertex_color", "ensure_viewport_settings")
-    for mod in (pm, bl):
-        if not mod:
+        eprint(f"[HeadlessWrap] Could not import lu_toolbox.process_model: {ex}")
+        return patched
+
+    target_methods = {"apply_vertex_colors", "set_viewport_to_vertex_color", "ensure_viewport_settings"}
+    for name in dir(pm):
+        obj = getattr(pm, name, None)
+        try:
+            is_op = isinstance(obj, type) and issubclass(obj, bpy.types.Operator)
+        except Exception:
+            is_op = False
+        if not is_op:
             continue
-        for name in dir(mod):
-            obj = getattr(mod, name, None)
-            if isinstance(obj, type) and issubclass(obj, bpy.types.Operator):
-                for m in target_methods:
-                    if _headless_patch_method(obj, m):
-                        patched = True
+        for m in target_methods:
+            try:
+                if _wrap_ctx_method(obj, m):
+                    patched = True
+            except Exception as ex:
+                eprint(f"[HeadlessWrap] Failed to wrap {obj.__name__}.{m}: {ex}")
     if patched:
-        print("[HeadlessPatch] Applied proactive UI safety patches.")
+        print("[HeadlessWrap] Viewport methods wrapped for headless parity.")
     return patched
 
-# --------------------- Import, export, ops ---------------------
+# --------------------- Import / Export helpers ---------------------
 def ensure_vertex_colors_exist(layer_name="Col"):
     created = 0
     for obj in list(bpy.data.objects):
@@ -190,11 +224,45 @@ def ensure_vertex_colors_exist(layer_name="Col"):
         print("[HeadlessPrep] Vertex color layers already present.")
 
 def try_import_lxf(path: str, op_override: str = None) -> None:
+    """Import .lxf or .lxfml, preferring direct .lxf import. Unzip only as fallback."""
     ext = os.path.splitext(path)[1].lower()
-    work_path = path
     temp_dir = None
-    try:
-        if ext == ".lxf":
+
+    op_ids = []
+    if op_override:
+        op_ids.append(op_override)
+    if ext == ".lxf":
+        op_ids += ["import_scene.importldd", "import_scene.lxf"]
+    else:
+        op_ids += ["import_scene.importldd", "import_scene.lxfml"]
+
+    attempts = [
+        lambda op, p: op(filepath=p),
+        lambda op, p: op(path=p),
+        lambda op, p: op(directory=os.path.dirname(p), files=[{'name': os.path.basename(p)}]),
+    ]
+
+    last_err = None
+    # Direct import first
+    for op_id in op_ids:
+        try:
+            mod, func = op_id.split(".", 1)
+            operator = getattr(getattr(bpy.ops, mod), func)
+        except Exception as ex:
+            last_err = ex
+            continue
+        for call in attempts:
+            try:
+                call(operator, path)
+                print(f"[Import] Imported via {op_id}")
+                return
+            except Exception as ex:
+                last_err = ex
+                continue
+
+    # Fallback for .lxf: unzip -> .lxfml
+    if ext == ".lxf":
+        try:
             temp_dir = tempfile.mkdtemp(prefix="lxf_unpacked_")
             with zipfile.ZipFile(path, 'r') as zf:
                 zf.extractall(temp_dir)
@@ -207,39 +275,26 @@ def try_import_lxf(path: str, op_override: str = None) -> None:
                 if lxfml: break
             if not lxfml:
                 raise RuntimeError("No .lxfml found inside .lxf")
-            work_path = lxfml
-
-        op_ids = []
-        if op_override:
-            op_ids.append(op_override)
-        op_ids += ["import_scene.importldd","import_scene.lxfml","import_scene.lxf"]
-
-        attempts = [
-            lambda op: op(filepath=work_path),
-            lambda op: op(path=work_path),
-            lambda op: op(directory=os.path.dirname(work_path), files=[{'name': os.path.basename(work_path)}]),
-        ]
-
-        last_err = None
-        for op_id in op_ids:
-            try:
-                mod, func = op_id.split(".", 1)
-                operator = getattr(getattr(bpy.ops, mod), func)
-            except Exception as ex:
-                last_err = ex
-                continue
-            for call in attempts:
+            for op_id in ["import_scene.importldd", "import_scene.lxfml"]:
                 try:
-                    call(operator)
-                    print(f"[Import] Imported via {op_id}")
-                    return
+                    mod, func = op_id.split(".", 1)
+                    operator = getattr(getattr(bpy.ops, mod), func)
                 except Exception as ex:
                     last_err = ex
                     continue
-        raise RuntimeError(f"Could not import '{path}'. Last error: {last_err}")
-    finally:
-        if temp_dir and os.path.isdir(temp_dir):
-            shutil.rmtree(temp_dir, ignore_errors=True)
+                for call in attempts:
+                    try:
+                        call(operator, lxfml)
+                        print(f"[Import] Imported via {op_id} (unzipped .lxfml fallback)")
+                        return
+                    except Exception as ex:
+                        last_err = ex
+                        continue
+        finally:
+            if temp_dir and os.path.isdir(temp_dir):
+                shutil.rmtree(temp_dir, ignore_errors=True)
+
+    raise RuntimeError(f"Could not import '{path}'. Last error: {last_err}")
 
 def call_op(op_id: str, label: str):
     if "." not in op_id:
@@ -335,6 +390,7 @@ def main():
     else:
         print("[LU] No --brickdb provided; if importer needs it, set in addon prefs or pass --brickdb")
 
+    # Apply headless patches that keep parity (wrap methods; don't stub them)
     _apply_headless_patches()
 
     # Device policy
@@ -360,7 +416,7 @@ def main():
         traceback.print_exc()
         sys.exit(3)
 
-    # Ensure VCols for Bake
+    # Ensure VCols exist for Bake (LU should fill them during process_model)
     try:
         ensure_vertex_colors_exist()
     except Exception as ex:
