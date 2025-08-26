@@ -1,11 +1,14 @@
-# lu_batch_driver_v2.py
-# Headless LXF/LXFML -> NIF (LEGO Universe) pipeline (GPU detection fix + job wait)
-import sys, os, argparse, zipfile, tempfile, shutil, traceback, time
+# lu_batch_driver.py
+# Headless LXF/LXFML -> NIF (LEGO Universe)
+# Minimal pipeline with device auto-detect:
+#   --device auto (default): honor saved Blender prefs (CUDA/OPTIX enabled state)
+#   --device cuda/optix/cpu: force backend
+# Keeps: headless UI patches, importer robustness, vertex-color ensure, export scale fix.
+import sys, os, argparse, zipfile, tempfile, shutil, traceback
 import bpy
 
 def eprint(*a): print(*a, file=sys.stderr)
-
-print("=== LU DRIVER START v2 ===")
+print("=== LU DRIVER START (auto-device) ===")
 
 def split_script_argv():
     argv = sys.argv
@@ -13,111 +16,100 @@ def split_script_argv():
         return argv[argv.index("--")+1:]
     return argv[1:]
 
-# --------------------- Device setup ---------------------
+# --------------------- Device handling ---------------------
 def _refresh_cycles_devices(cp):
-    # Blender 3.x variants: refresh_devices() or get_devices()
-    ok = False
     for attr in ("refresh_devices", "get_devices"):
         fn = getattr(cp, attr, None)
         if callable(fn):
             try:
-                if attr == "get_devices":
-                    fn()  # some builds require calling without args
-                else:
-                    fn()
-                ok = True
-            except Exception as ex:
-                eprint(f"[Device] {attr} failed: {ex}")
-    return ok
+                fn()
+            except Exception:
+                pass
 
-def set_cycles_device(device: str) -> str:
+def _log_devices(cp, prefix="[Device] Found"):
+    try:
+        for d in cp.devices:
+            print(f"{prefix}: type={getattr(d,'type','?')} name={getattr(d,'name','?')} use={getattr(d,'use','?')}")
+    except Exception as ex:
+        eprint(f"[Device] Listing devices failed: {ex}")
+
+def set_cycles_device_auto():
+    """Honor existing prefs; enable LU GPU flags based on whether any CUDA/OPTIX device is enabled."""
+    try:
+        bpy.ops.preferences.addon_enable(module="cycles")
+    except Exception:
+        pass
+    prefs = bpy.context.preferences
+    cycles_prefs = prefs.addons.get("cycles")
+    if not cycles_prefs:
+        eprint("[Device] Cycles addon not available; auto -> CPU.")
+        bpy.context.scene.cycles.device = 'CPU'
+        return 'cpu'
+    cp = cycles_prefs.preferences
+    _refresh_cycles_devices(cp)
+    _log_devices(cp)
+    any_optix = any(getattr(d,'type','')=='OPTIX' and getattr(d,'use',False) for d in cp.devices)
+    any_cuda  = any(getattr(d,'type','')=='CUDA'  and getattr(d,'use',False) for d in cp.devices)
+    if any_optix or any_cuda:
+        bpy.context.scene.cycles.device = 'GPU'
+        used = 'optix' if any_optix else 'cuda'
+        print(f"[Device] AUTO: Using {used.upper()} from saved prefs")
+        return used
+    bpy.context.scene.cycles.device = 'CPU'
+    print("[Device] AUTO: No GPUs enabled in prefs -> Using CPU")
+    return 'cpu'
+
+def set_cycles_device_forced(device: str):
     want = (device or 'cpu').lower()
     try:
         bpy.ops.preferences.addon_enable(module="cycles")
     except Exception:
         pass
-
     prefs = bpy.context.preferences
     cycles_prefs = prefs.addons.get("cycles")
     if not cycles_prefs:
         eprint("[Device] Cycles addon not available; using CPU.")
         bpy.context.scene.cycles.device = 'CPU'
         return 'cpu'
-
     cp = cycles_prefs.preferences
-
-    backend = None
-    if want == 'cpu':
-        backend = 'NONE'
-    elif want == 'cuda':
-        backend = 'CUDA'
-    elif want == 'optix':
-        backend = 'OPTIX'
-    else:
-        backend = 'NONE'
-
-    # select backend
+    backend = 'NONE' if want=='cpu' else ('CUDA' if want=='cuda' else 'OPTIX')
     try:
         cp.compute_device_type = backend
     except Exception as ex:
         eprint(f"[Device] Cannot set backend {backend}: {ex}")
         backend = 'NONE'
         cp.compute_device_type = backend
-
-    # enumerate devices
     _refresh_cycles_devices(cp)
+    _log_devices(cp)
     found_gpu = False
     try:
         for d in cp.devices:
-            # print discovered devices
-            print(f"[Device] Found: type={getattr(d,'type','?')} name={getattr(d,'name','?')} use={getattr(d,'use','?')}")
-        for d in cp.devices:
-            if backend in {'CUDA','OPTIX'} and getattr(d, "type", "") == backend:
+            if backend in {'CUDA','OPTIX'} and getattr(d,'type','') == backend:
                 d.use = True
                 found_gpu = True
-            elif getattr(d, "type", "") == 'CPU':
+            elif getattr(d,'type','') == 'CPU':
                 d.use = True
     except Exception as ex:
         eprint(f"[Device] Iterating devices failed: {ex}")
-
     if backend in {'CUDA','OPTIX'} and not found_gpu:
-        eprint(f"[Device] No {backend} GPUs found; falling back to CPU.")
-        cp.compute_device_type = 'NONE'
+        eprint(f"[Device] No {backend} GPUs found; using CPU.")
         bpy.context.scene.cycles.device = 'CPU'
         return 'cpu'
-
     if backend == 'NONE':
         bpy.context.scene.cycles.device = 'CPU'
         print("[Device] Using CPU")
         return 'cpu'
-    else:
-        bpy.context.scene.cycles.device = 'GPU'
-        print(f"[Device] Using {backend}")
-        return want
+    bpy.context.scene.cycles.device = 'GPU'
+    print(f"[Device] Using {backend}")
+    return want
 
-# --------------------- Wait helpers ---------------------
-def _any_jobs_running():
+def set_lu_gpu_flags(use_gpu: bool):
     try:
-        # Blender 3.x exposes job tags like RENDER, RENDER_PREVIEW, OBJECT_BAKE, SCENE_EXPORT
-        tags = ("OBJECT_BAKE","RENDER","RENDER_PREVIEW","SCENE_EXPORT")
-        return any(bpy.app.is_job_running(t) for t in tags)
-    except Exception:
-        return False
-
-def wait_until_idle(tag=""):
-    # Drain job queue and update depsgraph
-    t0 = time.time()
-    loops = 0
-    while _any_jobs_running():
-        time.sleep(0.2)
-        loops += 1
-        if loops % 10 == 0:
-            print(f"[Wait] Still busy... {loops/5:.1f}s")
-    try:
-        bpy.context.view_layer.update()
-    except Exception:
-        pass
-    print(f"[Wait] Idle after {time.time()-t0:.2f}s {('('+tag+')') if tag else ''}")
+        bpy.context.scene.lutb_process_use_gpu = bool(use_gpu)
+        bpy.context.scene.lutb_bake_use_gpu = bool(use_gpu)
+        print(f"[Props] Set lutb_process_use_gpu / lutb_bake_use_gpu = {use_gpu}")
+    except Exception as ex:
+        eprint(f"[Props] Could not set LU GPU flags: {ex}")
 
 # --------------------- Headless UI patching ---------------------
 def _headless_patch_method(cls, method_name):
@@ -145,7 +137,6 @@ def _apply_headless_patches():
         bl = __import__("lu_toolbox.bake_lighting", fromlist=['*'])
     except Exception as ex:
         eprint(f"[HeadlessPatch] Could not import lu_toolbox.bake_lighting: {ex}")
-
     target_methods = ("apply_vertex_colors", "set_viewport_to_vertex_color", "ensure_viewport_settings")
     for mod in (pm, bl):
         if not mod:
@@ -160,15 +151,7 @@ def _apply_headless_patches():
         print("[HeadlessPatch] Applied proactive UI safety patches.")
     return patched
 
-# --------------------- LU flags & helpers ---------------------
-def set_lu_gpu_flags(use_gpu: bool):
-    try:
-        bpy.context.scene.lutb_process_use_gpu = bool(use_gpu)
-        bpy.context.scene.lutb_bake_use_gpu = bool(use_gpu)
-        print(f"[Props] Set lutb_process_use_gpu / lutb_bake_use_gpu = {use_gpu}")
-    except Exception as ex:
-        eprint(f"[Props] Could not set known LU Toolbox GPU flags: {ex}")
-
+# --------------------- Import, export, ops ---------------------
 def ensure_vertex_colors_exist(layer_name="Col"):
     created = 0
     for obj in list(bpy.data.objects):
@@ -206,7 +189,6 @@ def ensure_vertex_colors_exist(layer_name="Col"):
     else:
         print("[HeadlessPrep] Vertex color layers already present.")
 
-# --------------------- Import, export, ops ---------------------
 def try_import_lxf(path: str, op_override: str = None) -> None:
     ext = os.path.splitext(path)[1].lower()
     work_path = path
@@ -230,16 +212,12 @@ def try_import_lxf(path: str, op_override: str = None) -> None:
         op_ids = []
         if op_override:
             op_ids.append(op_override)
-        op_ids += [
-            "import_scene.importldd",
-            "import_scene.lxfml",
-            "import_scene.lxf",
-        ]
+        op_ids += ["import_scene.importldd","import_scene.lxfml","import_scene.lxf"]
 
         attempts = [
             lambda op: op(filepath=work_path),
             lambda op: op(path=work_path),
-            lambda op: op(directory=os.path.dirname(work_path), files=[{"name": os.path.basename(work_path)}]),
+            lambda op: op(directory=os.path.dirname(work_path), files=[{'name': os.path.basename(work_path)}]),
         ]
 
         last_err = None
@@ -304,7 +282,6 @@ def export_nif(out_path: str):
     if op is None:
         raise RuntimeError("NifTools export operator not found: export_scene.nif")
     print(f"[Export] export_scene.nif -> {out_path}")
-    # Save/pack images to avoid internal-only warnings
     try:
         bpy.ops.image.save_all_modified()
     except Exception:
@@ -326,7 +303,7 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--input", required=True)
     parser.add_argument("--output", required=True)
-    parser.add_argument("--device", default="cpu", choices=["cpu", "cuda", "optix"])
+    parser.add_argument("--device", default="auto", choices=["auto","cpu","cuda","optix"])
     parser.add_argument("--import-op", default=None)
     parser.add_argument("--brickdb", default=None)
     parser.add_argument("--process-op", default="lutb.process_model")
@@ -340,12 +317,14 @@ def main():
         sys.exit(2)
     os.makedirs(os.path.dirname(dst), exist_ok=True)
 
+    # Enable required add-ons (best-effort)
     for mod in ["lu_toolbox", "io_scene_niftools"]:
         try:
             bpy.ops.preferences.addon_enable(module=mod)
         except Exception:
             pass
 
+    # Set Brick DB if provided
     if args.brickdb:
         try:
             ap = bpy.context.preferences.addons["lu_toolbox"].preferences
@@ -358,7 +337,11 @@ def main():
 
     _apply_headless_patches()
 
-    actual = set_cycles_device(args.device)
+    # Device policy
+    if args.device == 'auto':
+        actual = set_cycles_device_auto()
+    else:
+        actual = set_cycles_device_forced(args.device)
     set_lu_gpu_flags(use_gpu=(actual != 'cpu'))
 
     # Import
@@ -391,24 +374,19 @@ def main():
         traceback.print_exc()
         sys.exit(4)
 
-    # Wait for any background jobs (bake etc.) to fully finish
-    wait_until_idle("post-bake")
-
     # NifTools scene setup (best-effort)
     try:
         set_niftools_game_to_lu()
     except Exception as ex:
         eprint("[NifTools] Warning:", ex)
 
-    # Export (and wait just in case exporter spawns a job)
+    # Export
     try:
         export_nif(dst)
     except Exception as ex:
         eprint("[Export] FAILED:", ex)
         traceback.print_exc()
         sys.exit(5)
-
-    wait_until_idle("post-export")
 
     print("[Done] Success.")
     sys.exit(0)
