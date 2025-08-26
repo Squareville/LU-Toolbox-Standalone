@@ -1,26 +1,37 @@
-# lu_batch_driver_vWORKING.py
-# Minimal, conservative driver: mirrors the previously working flow
-# (import -> process -> ensure vcols -> bake -> set game -> export)
-# Differences from your last run:
-#   - Export: removed unsupported "game" kw (kept scale_correction=1.0)
-#   - Arg parsing: robust (-- args or plain argv)
-#   - Early "DRIVER START" print to confirm execution
-import sys, os, argparse, zipfile, tempfile, shutil, traceback
+# lu_batch_driver_v2.py
+# Headless LXF/LXFML -> NIF (LEGO Universe) pipeline (GPU detection fix + job wait)
+import sys, os, argparse, zipfile, tempfile, shutil, traceback, time
 import bpy
 
 def eprint(*a): print(*a, file=sys.stderr)
 
-print("=== LU DRIVER START ===")
+print("=== LU DRIVER START v2 ===")
 
 def split_script_argv():
     argv = sys.argv
     if "--" in argv:
         return argv[argv.index("--")+1:]
-    # fallback (e.g., run via runpy or if Blender didn't include '--')
     return argv[1:]
 
+# --------------------- Device setup ---------------------
+def _refresh_cycles_devices(cp):
+    # Blender 3.x variants: refresh_devices() or get_devices()
+    ok = False
+    for attr in ("refresh_devices", "get_devices"):
+        fn = getattr(cp, attr, None)
+        if callable(fn):
+            try:
+                if attr == "get_devices":
+                    fn()  # some builds require calling without args
+                else:
+                    fn()
+                ok = True
+            except Exception as ex:
+                eprint(f"[Device] {attr} failed: {ex}")
+    return ok
+
 def set_cycles_device(device: str) -> str:
-    device = (device or 'cpu').lower()
+    want = (device or 'cpu').lower()
     try:
         bpy.ops.preferences.addon_enable(module="cycles")
     except Exception:
@@ -34,40 +45,81 @@ def set_cycles_device(device: str) -> str:
         return 'cpu'
 
     cp = cycles_prefs.preferences
-    if device == 'cpu':
-        cp.compute_device_type = 'NONE'
-        bpy.context.scene.cycles.device = 'CPU'
-        return 'cpu'
 
-    backend = 'CUDA' if device == 'cuda' else 'OPTIX'
+    backend = None
+    if want == 'cpu':
+        backend = 'NONE'
+    elif want == 'cuda':
+        backend = 'CUDA'
+    elif want == 'optix':
+        backend = 'OPTIX'
+    else:
+        backend = 'NONE'
+
+    # select backend
     try:
         cp.compute_device_type = backend
     except Exception as ex:
-        eprint(f"[Device] Backend {backend} not supported in this build ({ex}); falling back to CPU.")
-        cp.compute_device_type = 'NONE'
-        bpy.context.scene.cycles.device = 'CPU'
-        return 'cpu'
+        eprint(f"[Device] Cannot set backend {backend}: {ex}")
+        backend = 'NONE'
+        cp.compute_device_type = backend
 
-    has_gpu = False
+    # enumerate devices
+    _refresh_cycles_devices(cp)
+    found_gpu = False
     try:
         for d in cp.devices:
-            if getattr(d, "type", "") in {'CUDA', 'OPTIX'}:
+            # print discovered devices
+            print(f"[Device] Found: type={getattr(d,'type','?')} name={getattr(d,'name','?')} use={getattr(d,'use','?')}")
+        for d in cp.devices:
+            if backend in {'CUDA','OPTIX'} and getattr(d, "type", "") == backend:
                 d.use = True
-                has_gpu = True
+                found_gpu = True
             elif getattr(d, "type", "") == 'CPU':
                 d.use = True
     except Exception as ex:
-        eprint(f"[Device] Could not enumerate devices: {ex}")
+        eprint(f"[Device] Iterating devices failed: {ex}")
 
-    if not has_gpu:
+    if backend in {'CUDA','OPTIX'} and not found_gpu:
         eprint(f"[Device] No {backend} GPUs found; falling back to CPU.")
         cp.compute_device_type = 'NONE'
         bpy.context.scene.cycles.device = 'CPU'
         return 'cpu'
 
-    bpy.context.scene.cycles.device = 'GPU'
-    return device
+    if backend == 'NONE':
+        bpy.context.scene.cycles.device = 'CPU'
+        print("[Device] Using CPU")
+        return 'cpu'
+    else:
+        bpy.context.scene.cycles.device = 'GPU'
+        print(f"[Device] Using {backend}")
+        return want
 
+# --------------------- Wait helpers ---------------------
+def _any_jobs_running():
+    try:
+        # Blender 3.x exposes job tags like RENDER, RENDER_PREVIEW, OBJECT_BAKE, SCENE_EXPORT
+        tags = ("OBJECT_BAKE","RENDER","RENDER_PREVIEW","SCENE_EXPORT")
+        return any(bpy.app.is_job_running(t) for t in tags)
+    except Exception:
+        return False
+
+def wait_until_idle(tag=""):
+    # Drain job queue and update depsgraph
+    t0 = time.time()
+    loops = 0
+    while _any_jobs_running():
+        time.sleep(0.2)
+        loops += 1
+        if loops % 10 == 0:
+            print(f"[Wait] Still busy... {loops/5:.1f}s")
+    try:
+        bpy.context.view_layer.update()
+    except Exception:
+        pass
+    print(f"[Wait] Idle after {time.time()-t0:.2f}s {('('+tag+')') if tag else ''}")
+
+# --------------------- Headless UI patching ---------------------
 def _headless_patch_method(cls, method_name):
     if not hasattr(cls, method_name):
         return False
@@ -108,6 +160,7 @@ def _apply_headless_patches():
         print("[HeadlessPatch] Applied proactive UI safety patches.")
     return patched
 
+# --------------------- LU flags & helpers ---------------------
 def set_lu_gpu_flags(use_gpu: bool):
     try:
         bpy.context.scene.lutb_process_use_gpu = bool(use_gpu)
@@ -153,6 +206,7 @@ def ensure_vertex_colors_exist(layer_name="Col"):
     else:
         print("[HeadlessPrep] Vertex color layers already present.")
 
+# --------------------- Import, export, ops ---------------------
 def try_import_lxf(path: str, op_override: str = None) -> None:
     ext = os.path.splitext(path)[1].lower()
     work_path = path
@@ -250,6 +304,11 @@ def export_nif(out_path: str):
     if op is None:
         raise RuntimeError("NifTools export operator not found: export_scene.nif")
     print(f"[Export] export_scene.nif -> {out_path}")
+    # Save/pack images to avoid internal-only warnings
+    try:
+        bpy.ops.image.save_all_modified()
+    except Exception:
+        pass
     try:
         op(filepath=out_path, scale_correction=1.0)
     except TypeError:
@@ -262,6 +321,7 @@ def export_nif(out_path: str):
             pass
         op(filepath=out_path)
 
+# --------------------- Main ---------------------
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--input", required=True)
@@ -298,9 +358,10 @@ def main():
 
     _apply_headless_patches()
 
-    actual_device = set_cycles_device(args.device)
-    set_lu_gpu_flags(use_gpu=(actual_device != 'cpu'))
+    actual = set_cycles_device(args.device)
+    set_lu_gpu_flags(use_gpu=(actual != 'cpu'))
 
+    # Import
     try:
         try_import_lxf(src, op_override=args.import_op)
     except Exception as ex:
@@ -308,6 +369,7 @@ def main():
         traceback.print_exc()
         sys.exit(2)
 
+    # Process
     try:
         call_op(args.process_op, "Process Model")
     except Exception as ex:
@@ -315,11 +377,13 @@ def main():
         traceback.print_exc()
         sys.exit(3)
 
+    # Ensure VCols for Bake
     try:
         ensure_vertex_colors_exist()
     except Exception as ex:
         eprint(f"[HeadlessPrep] Could not ensure vertex colors: {ex}")
 
+    # Bake
     try:
         call_op(args.bake_op, "Bake Lighting")
     except Exception as ex:
@@ -327,17 +391,24 @@ def main():
         traceback.print_exc()
         sys.exit(4)
 
+    # Wait for any background jobs (bake etc.) to fully finish
+    wait_until_idle("post-bake")
+
+    # NifTools scene setup (best-effort)
     try:
         set_niftools_game_to_lu()
     except Exception as ex:
         eprint("[NifTools] Warning:", ex)
 
+    # Export (and wait just in case exporter spawns a job)
     try:
         export_nif(dst)
     except Exception as ex:
         eprint("[Export] FAILED:", ex)
         traceback.print_exc()
         sys.exit(5)
+
+    wait_until_idle("post-export")
 
     print("[Done] Success.")
     sys.exit(0)
