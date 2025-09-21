@@ -29,8 +29,11 @@ set "SRC_EXT=%~x1"
 REM Outputs in same directory with same basename
 set "OUT_NIF=%SRC_DIR%%SRC_NAME%.nif"
 set "OUT_BLEND=%SRC_DIR%%SRC_NAME%.blend"
-REM UGC output: pass stem (driver will resolve actual image, then DDS if --dds)
-set "UGC_OUT_STEM=%SRC_DIR%%SRC_NAME%"
+REM UGC output MUST be a real filename to avoid stem oddities
+set "UGC_OUT_PNG=%SRC_DIR%%SRC_NAME%.png"
+
+REM --- Nuke any pre-existing stray file literally named "NIF" in the source folder ---
+if exist "%SRC_DIR%NIF" del /f /q "%SRC_DIR%NIF" >nul 2>&1
 
 echo ==== [1/2] LXF->NIF (headless) ====
 "%BLENDER%" -b --factory-startup --python "%DRIVER_LU%" -- ^
@@ -45,10 +48,13 @@ if errorlevel 1 (
   exit /b 3
 )
 
+REM --- If step 1 created a stray "NIF", remove it now ---
+if exist "%SRC_DIR%NIF" del /f /q "%SRC_DIR%NIF" >nul 2>&1
+
 echo ==== [2/2] UGC Render (UI mode) ====
 "%BLENDER%" --python "%DRIVER_UGC%" -- ^
   --input "%OUT_BLEND%" ^
-  --output "%UGC_OUT_STEM%" ^
+  --output "%UGC_OUT_PNG%" ^
   --device optix ^
   --type-car ^
   --res 128 ^
@@ -60,6 +66,9 @@ if errorlevel 1 (
   echo [ERROR] UGC Render failed. See console above.
   exit /b 4
 )
+
+REM --- Final sweep: remove any stray "NIF" one last time ---
+if exist "%SRC_DIR%NIF" del /f /q "%SRC_DIR%NIF" >nul 2>&1
 
 echo Done.
 exit /b 0
